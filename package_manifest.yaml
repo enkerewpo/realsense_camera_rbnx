@@ -42,6 +42,8 @@ package:
   description: Intel RealSense D435i driver wrapper — declares RGB + depth + extrinsics contracts.
   license: Apache-2.0
 
+capability_id: realsense_camera
+
 build: bash scripts/build.sh
 start: bash scripts/start.sh
 
