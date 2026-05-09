@@ -149,12 +149,12 @@ def init(cfg: dict):
         _kill_realsense()
         return Err(f"no Image on {rgb_topic} within {sentinel_timeout:.1f}s")
 
-    cap.declare_ros2(
+    cap.declare_ros2_topic(
         "robonix/primitive/camera/rgb",
         topic=rgb_topic,
         qos="best_effort",
     )
-    cap.declare_ros2(
+    cap.declare_ros2_topic(
         "robonix/primitive/camera/depth",
         topic=depth_topic,
         qos="best_effort",
