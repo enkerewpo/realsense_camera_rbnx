@@ -34,7 +34,7 @@ import threading
 import time
 from pathlib import Path
 
-from robonix_api import Capability, Ok, Err
+from robonix_api import Primitive, Ok, Err
 
 logging.basicConfig(
     level=os.environ.get("REALSENSE_LOG_LEVEL", "INFO"),
@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("realsense")
 
-cap = Capability(id="realsense_camera", namespace="robonix/primitive/camera")
+cap = Primitive(id="realsense_camera", namespace="robonix/primitive/camera")
 
 _pkg_root: Path = Path(__file__).resolve().parent.parent
 _rs_proc: subprocess.Popen | None = None
