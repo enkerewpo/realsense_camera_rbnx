@@ -8,9 +8,18 @@ we deliberately do NOT atlas-route it under `primitive/imu/imu`
 (MID-360 IMU is canonical for the ranger). Subscribers needing the
 camera IMU directly can read /<camera_name>/imu.
 
+Capability surface:
+  primitive/camera/driver         rpc gRPC (lifecycle)
+  primitive/camera/rgb            topic_out ROS2 (continuous, raw)
+  primitive/camera/depth          topic_out ROS2 (continuous, raw)
+  primitive/camera/snapshot       rpc MCP (one-shot RGB JPEG — VLM-facing)
+  primitive/camera/depth_snapshot rpc MCP (one-shot depth as 8-bit JPEG)
+  primitive/camera/extrinsics     topic_out ROS2 (TODO — latched TF)
+
 Lifecycle:
     on_init      — spawn rs_launch.py with camera_name + profiles → wait
-                   for first RGB frame → declare rgb + depth topic_out.
+                   for first RGB frame → subscribe rgb+depth → declare
+                   rgb + depth topic_out + snapshot + depth_snapshot.
     on_shutdown  — kill realsense subprocess.
 
 Config (from manifest):
@@ -32,7 +41,10 @@ import signal
 import subprocess
 import threading
 import time
+from io import BytesIO
 from pathlib import Path
+
+import numpy as np
 
 from robonix_api import Primitive, Ok, Err
 
@@ -46,6 +58,13 @@ cap = Primitive(id="realsense_camera", namespace="robonix/primitive/camera")
 
 _pkg_root: Path = Path(__file__).resolve().parent.parent
 _rs_proc: subprocess.Popen | None = None
+
+# ── snapshot state ───────────────────────────────────────────────────────────
+_state_lock = threading.Lock()
+_latest_rgb_jpeg: bytes | None = None
+_latest_depth_jpeg: bytes | None = None
+_rgb_frame_id: str = "camera_435i_color_optical_frame"
+_depth_frame_id: str = "camera_435i_depth_optical_frame"
 
 
 def _spawn_realsense(cfg: dict) -> None:
@@ -95,44 +114,140 @@ def _kill_realsense() -> None:
             pass
 
 
-def _wait_for_image(topic: str, timeout_s: float) -> bool:
+# ── image conversion ─────────────────────────────────────────────────────────
+def _ros_image_to_jpeg(msg) -> bytes:
+    """Encode a sensor_msgs/Image into JPEG bytes.
+    Supports: rgb8, bgr8, rgba8, bgra8, mono8, 16uc1, 32fc1."""
+    h, w = msg.height, msg.width
+    enc = msg.encoding.lower()
+    if enc == "rgb8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+    elif enc == "bgr8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)[:, :, ::-1]
+    elif enc == "rgba8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+    elif enc == "bgra8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 4)[:, :, :3][:, :, ::-1]
+    elif enc == "mono8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w)
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif enc == "16uc1":
+        # realsense depth: 16-bit mm. Normalize to 8-bit for visualization.
+        raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(h, w)
+        arr = (raw / raw.max() * 255).astype(np.uint8) if raw.max() > 0 else np.zeros((h, w), np.uint8)
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif enc == "32fc1":
+        raw = np.frombuffer(msg.data, dtype=np.float32).reshape(h, w)
+        valid = np.isfinite(raw)
+        if valid.any():
+            mn, mx = raw[valid].min(), raw[valid].max()
+            norm = np.where(valid, (raw - mn) / max(mx - mn, 1e-6) * 255, 0).astype(np.uint8)
+        else:
+            norm = np.zeros((h, w), np.uint8)
+        arr = np.stack([norm, norm, norm], axis=-1)
+    else:
+        raise ValueError(f"unsupported image encoding: {enc}")
+    from PIL import Image as PILImage
+    buf = BytesIO()
+    PILImage.fromarray(np.ascontiguousarray(arr)).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _on_rgb(msg) -> None:
+    global _latest_rgb_jpeg, _rgb_frame_id
     try:
-        import rclpy
-        from rclpy.node import Node
-        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-        from sensor_msgs.msg import Image
-    except ImportError as e:
-        log.warning("rclpy unavailable (%s); skipping sentinel wait", e)
-        return True
-    rclpy.init(args=None)
-    node = Node("realsense_atlas_sentinel")
-    qos = QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
-        durability=DurabilityPolicy.VOLATILE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
+        jpg = _ros_image_to_jpeg(msg)
+        with _state_lock:
+            _latest_rgb_jpeg = jpg
+            if msg.header.frame_id:
+                _rgb_frame_id = msg.header.frame_id
+    except Exception as e:  # noqa: BLE001
+        log.warning("RGB conversion error: %s", e)
+
+
+def _on_depth(msg) -> None:
+    global _latest_depth_jpeg, _depth_frame_id
+    try:
+        jpg = _ros_image_to_jpeg(msg)
+        with _state_lock:
+            _latest_depth_jpeg = jpg
+            if msg.header.frame_id:
+                _depth_frame_id = msg.header.frame_id
+    except Exception as e:  # noqa: BLE001
+        log.warning("depth conversion error: %s", e)
+
+
+# ── MCP snapshot tools (typed against codegen MCP dataclasses) ──────────────
+import builtin_interfaces_mcp  # noqa: E402
+import std_msgs_mcp  # noqa: E402
+from sensor_msgs_mcp import Image  # noqa: E402
+from std_msgs_mcp import Empty  # noqa: E402
+
+
+def _now_header(frame_id: str) -> std_msgs_mcp.Header:
+    now = time.time()
+    sec = int(now)
+    ns = int((now % 1) * 1e9) % 1_000_000_000
+    return std_msgs_mcp.Header(
+        stamp=builtin_interfaces_mcp.Time(sec=sec, nanosec=ns),
+        frame_id=frame_id,
     )
-    seen = threading.Event()
-    node.create_subscription(Image, topic, lambda _m: seen.set(), qos)
-    log.info("waiting for first frame on %s — up to %.1fs", topic, timeout_s)
-    deadline = time.monotonic() + timeout_s
-    try:
-        while time.monotonic() < deadline:
-            rclpy.spin_once(node, timeout_sec=0.2)
-            if seen.is_set():
-                break
-    finally:
-        node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
-    return seen.is_set()
 
 
+def _jpeg_to_image_mcp(jpg: bytes, frame_id: str) -> Image:
+    from PIL import Image as PILImage
+    im = PILImage.open(BytesIO(jpg))
+    w, h = im.size
+    return Image(
+        header=_now_header(frame_id),
+        height=h, width=w,
+        encoding="jpeg",
+        is_bigendian=0,
+        step=len(jpg),
+        data=jpg,
+    )
+
+
+def _empty_image_error(reason: str) -> Image:
+    """Return a tiny black 1x1 JPEG when we can't deliver a frame.
+    Reason is encoded in frame_id so the agent can read it."""
+    from PIL import Image as PILImage
+    buf = BytesIO()
+    PILImage.new("RGB", (1, 1), (0, 0, 0)).save(buf, format="JPEG")
+    return _jpeg_to_image_mcp(buf.getvalue(), f"error:{reason}")
+
+
+@cap.mcp("robonix/primitive/camera/snapshot")
+def snapshot(msg: Empty) -> Image:
+    """PRIMARY perception tool. Use freely — between every chassis/cmd
+    burst — to see what's in front of the robot and decide what to do
+    next. Returns the current RGB frame as a JPEG-encoded
+    sensor_msgs/Image (encoding='jpeg', data=JPEG bytes)."""
+    with _state_lock:
+        data = _latest_rgb_jpeg
+        frame_id = _rgb_frame_id
+    if data is None:
+        return _empty_image_error("no RGB frame received yet")
+    return _jpeg_to_image_mcp(data, frame_id)
+
+
+@cap.mcp("robonix/primitive/camera/depth_snapshot")
+def depth_snapshot(msg: Empty) -> Image:
+    """Depth snapshot as 8-bit JPEG (normalized for visualization).
+    Returns sensor_msgs/Image with encoding='jpeg'. For actual metric
+    depth, subscribe to robonix/primitive/camera/depth (16UC1)."""
+    with _state_lock:
+        data = _latest_depth_jpeg
+        frame_id = _depth_frame_id
+    if data is None:
+        return _empty_image_error("no depth frame received yet")
+    return _jpeg_to_image_mcp(data, frame_id)
+
+
+# ── lifecycle ────────────────────────────────────────────────────────────────
 @cap.on_init
 def init(cfg: dict):
-    """REGISTERED → INACTIVE: spawn realsense, wait for RGB, declare rgb/depth."""
+    """REGISTERED → INACTIVE: spawn realsense, subscribe RGB+depth, declare."""
     cam = cfg.get("camera_name", "camera_435i")
     rgb_topic = cfg.get("rgb_topic", f"/{cam}/color/image_raw")
     depth_topic = cfg.get(
@@ -145,21 +260,34 @@ def init(cfg: dict):
     except Exception as e:  # noqa: BLE001
         return Err(f"spawn realsense failed: {e}")
 
-    if not _wait_for_image(rgb_topic, sentinel_timeout):
+    # Subscribe RGB + depth via robonix_api (declare=False — we declare
+    # the ros2 topic_out interfaces explicitly below, after sentinel passes).
+    cap.create_subscription(
+        "robonix/primitive/camera/rgb",
+        topic=rgb_topic, msg_type="Image",
+        callback=_on_rgb, qos="best_effort", declare=False,
+    )
+    cap.create_subscription(
+        "robonix/primitive/camera/depth",
+        topic=depth_topic, msg_type="Image",
+        callback=_on_depth, qos="best_effort", declare=False,
+    )
+
+    # Gate INIT on first RGB arriving — webots/jetson cold-boot can lag.
+    if not cap.wait_for_topic(rgb_topic, "Image", sentinel_timeout):
         _kill_realsense()
         return Err(f"no Image on {rgb_topic} within {sentinel_timeout:.1f}s")
 
     cap.declare_ros2_topic(
         "robonix/primitive/camera/rgb",
-        topic=rgb_topic,
-        qos="best_effort",
+        topic=rgb_topic, qos="best_effort",
     )
     cap.declare_ros2_topic(
         "robonix/primitive/camera/depth",
-        topic=depth_topic,
-        qos="best_effort",
+        topic=depth_topic, qos="best_effort",
     )
-    log.info("init complete: rgb=%s depth=%s", rgb_topic, depth_topic)
+    log.info("init complete: rgb=%s depth=%s + snapshot/depth_snapshot MCP exposed",
+             rgb_topic, depth_topic)
     return Ok()
 
 
