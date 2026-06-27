@@ -262,6 +262,7 @@ def init(cfg: dict):
     depth_topic = cfg.get(
         "depth_topic", f"/{cam}/aligned_depth_to_color/image_raw"
     )
+    intrinsics_topic = cfg.get("intrinsics_topic", f"/{cam}/color/camera_info")
     sentinel_timeout = float(cfg.get("sentinel_timeout_s", 30.0))
 
     try:
@@ -295,8 +296,17 @@ def init(cfg: dict):
         "robonix/primitive/camera/depth",
         topic=depth_topic, qos="best_effort",
     )
-    log.info("init complete: rgb=%s depth=%s + snapshot/depth_snapshot MCP exposed",
-             rgb_topic, depth_topic)
+    # Pinhole intrinsics (sensor_msgs/CameraInfo) for the color stream. Depth is
+    # aligned_depth_to_color, so consumers reuse the color K to back-project.
+    # Without this, scene's ConceptGraphs detector blocks forever on
+    # "waiting for camera intrinsics" and never produces 3D objects.
+    cap.declare_ros2_topic(
+        "robonix/primitive/camera/intrinsics",
+        topic=intrinsics_topic,
+        qos="reliable",
+    )
+    log.info("init complete: rgb=%s depth=%s intrinsics=%s + snapshot/depth_snapshot MCP exposed",
+             rgb_topic, depth_topic, intrinsics_topic)
     return Ok()
 
 
